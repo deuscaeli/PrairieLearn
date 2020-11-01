@@ -1,5 +1,4 @@
 const ERR = require('async-stacktrace');
-const _ = require('lodash');
 const express = require('express');
 const router = express.Router();
 const async = require('async');
@@ -8,41 +7,53 @@ const sqldb = require('@prairielearn/prairielib/sql-db');
 const sqlLoader = require('@prairielearn/prairielib/sql-loader');
 const fs = require('fs-extra');
 const path = require('path');
-const uuidv4 = require('uuid/v4');
+const { v4: uuidv4 } = require('uuid');
 const debug = require('debug')('prairielearn:instructorFileEditor');
+const { callbackify } = require('util');
 const logger = require('../../lib/logger');
 const serverJobs = require('../../lib/server-jobs');
 const namedLocks = require('../../lib/named-locks');
-const tmp = require('tmp');
 const syncFromDisk = require('../../sync/syncFromDisk');
 const courseUtil = require('../../lib/courseUtil');
 const requireFrontend = require('../../lib/require-frontend');
 const config = require('../../lib/config');
-const AWS = require('aws-sdk');
+const editorUtil = require('../../lib/editorUtil');
+const { default: AnsiUp } = require('ansi_up');
 const sha256 = require('crypto-js/sha256');
+const b64Util = require('../../lib/base64-util');
+const fileStore = require('../../lib/file-store');
+const isBinaryFile = require('isbinaryfile').isBinaryFile;
+const { decodePath } = require('../../lib/uri-util');
+const chunks = require('../../lib/chunks');
 
 const sql = sqlLoader.loadSqlEquiv(__filename);
 
-router.get('/instructorFileEditorClient.js', (req, res) => {
-    debug('Responding to request for /instructorFileEditorClient.js');
-    res.sendFile(path.join(__dirname, './instructorFileEditorClient.js'));
-});
-
-router.get('/', (req, res, next) => {
+router.get('/*', (req, res, next) => {
     if (!res.locals.authz_data.has_course_permission_edit) return next(new Error('Insufficient permissions'));
 
-    if (_.isEmpty(req.query)) {
-        return next(error.make(400, 'no query', {
-            locals: res.locals,
-            body: req.body,
-        }));
+    let workingPath;
+    if (req.params[0]) {
+        try {
+            workingPath = decodePath(req.params[0]);
+        } catch(err) {
+            return next(new Error(`Invalid path: ${req.params[0]}`));
+        }
+    } else {
+        return next(new Error(`No path`));
     }
 
-    if (!('file' in req.query)) {
-        return next(error.make(400, 'no file in query', {
-            locals: res.locals,
-            body: req.body,
-        }));
+    // This is a hack because we do not have a standard for how to serve
+    // page-specific client-side code. I would normally have done this with
+    // a route parameter, but all routes are being mapped to file paths, so
+    // I am using a query string instead.
+    if (req.query.serve) {
+        if (req.query.serve == 'client') {
+            debug('Responding to request for /instructorFileEditorClient.js');
+            res.sendFile(path.join(__dirname, './instructorFileEditorClient.js'));
+            return;
+        } else {
+            return next(new Error(`Invalid query: serve=${req.query.serve}`));
+        }
     }
 
     let fileEdit = {
@@ -50,25 +61,38 @@ router.get('/', (req, res, next) => {
         userID: res.locals.user.user_id,
         courseID: res.locals.course.id,
         coursePath: res.locals.course.path,
-        dirName: path.dirname(req.query.file),
-        fileName: path.basename(req.query.file),
-        fileNameForDisplay: path.normalize(req.query.file),
+        dirName: path.dirname(workingPath),
+        fileName: path.basename(workingPath),
+        fileNameForDisplay: path.normalize(workingPath),
     };
 
-    const ext = path.extname(req.query.file);
-    if (ext == '.json') {
-        fileEdit.aceMode = 'json';
-    } else if (ext == '.html') {
-        fileEdit.aceMode = 'html';
-    } else if (ext == '.py') {
-        fileEdit.aceMode = 'python';
+    const ext = path.extname(workingPath);
+    // If you add to this list, make sure the corresponding list in instructorFileBrowser.js is consistent.
+    const extensionModeMap = {
+            '.json': 'json',
+            '.html': 'html',
+            '.py': 'python',
+            '.txt': 'text',
+            '.md': 'markdown',
+            '.mustache': 'text',
+            '.css': 'css',
+            '.csv': 'text',
+            '.js': 'javascript',
+            '.m': 'matlab',
+            '.c': 'c_cpp',
+            '.cpp': 'c_cpp',
+            '.h': 'c_cpp',
+    };
+    const fileEditMode = extensionModeMap[ext];
+    if (fileEditMode) {
+        fileEdit.aceMode = fileEditMode;
     } else {
         debug(`Could not find an ace mode to match extension: ${ext}`);
     }
 
     // Do not allow users to edit the exampleCourse
-    if (res.locals.course.options.isExampleCourse) {
-        return next(error.make(400, `attempting to edit file inside example course: ${req.query.file}`, {
+    if (res.locals.course.example_course) {
+        return next(error.make(400, `attempting to edit file inside example course: ${workingPath}`, {
             locals: res.locals,
             body: req.body,
         }));
@@ -79,13 +103,13 @@ router.get('/', (req, res, next) => {
     const relPath = path.relative(fileEdit.coursePath, fullPath);
     debug(`Edit file in browser\n fileName: ${fileEdit.fileName}\n coursePath: ${fileEdit.coursePath}\n fullPath: ${fullPath}\n relPath: ${relPath}`);
     if (relPath.split(path.sep)[0] == '..' || path.isAbsolute(relPath)) {
-        return next(error.make(400, `attempting to edit file outside course directory: ${req.query.file}`, {
+        return next(error.make(400, `attempting to edit file outside course directory: ${workingPath}`, {
             locals: res.locals,
             body: req.body,
         }));
     }
 
-    async.series([
+    async.waterfall([
         (callback) => {
             debug('Read from db');
             readEdit(fileEdit, (err) => {
@@ -95,11 +119,26 @@ router.get('/', (req, res, next) => {
         },
         (callback) => {
             debug('Read from disk');
-            fs.readFile(fullPath, 'utf8', (err, contents) => {
+            fs.readFile(fullPath, (err, contents) => {
                 if (ERR(err, callback)) return;
-                fileEdit.diskContents = b64EncodeUnicode(contents);
+                fileEdit.diskContents = b64Util.b64EncodeUnicode(contents.toString('utf8'));
                 fileEdit.diskHash = getHash(fileEdit.diskContents);
-                callback(null);
+                callback(null, contents);
+            });
+        },
+        (contents, callback) => {
+            isBinaryFile(contents).then((result) => {
+                debug(`isBinaryFile: ${result}`);
+                if (result) {
+                    debug('found a binary file');
+                    callback(new Error('Cannot edit binary file'));
+                } else {
+                    debug('found a text file');
+                    callback(null);
+                }
+            }, (err) => {
+                if (ERR(err, callback)) return;
+                callback(null); // should never get here
             });
         },
         (callback) => {
@@ -107,12 +146,23 @@ router.get('/', (req, res, next) => {
                 callback(null);
             } else {
                 debug('Read job sequence');
-                serverJobs.getJobSequence(fileEdit.jobSequenceId, res.locals.course.id, (err, job_sequence) => {
+                serverJobs.getJobSequenceWithFormattedOutput(fileEdit.jobSequenceId, res.locals.course.id, (err, job_sequence) => {
                     if (ERR(err, callback)) return;
                     fileEdit.jobSequence = job_sequence;
                     callback(null);
                 });
             }
+        },
+        (callback) => {
+            callbackify(editorUtil.getErrorsAndWarningsForFilePath)(res.locals.course.id, relPath, (err, data) => {
+                if (ERR(err, callback)) return;
+                const ansiUp = new AnsiUp();
+                fileEdit.sync_errors = data.errors;
+                fileEdit.sync_errors_ansified = ansiUp.ansi_to_html(fileEdit.sync_errors);
+                fileEdit.sync_warnings = data.warnings;
+                fileEdit.sync_warnings_ansified = ansiUp.ansi_to_html(fileEdit.sync_warnings);
+                callback(null);
+            });
         },
     ], (err) => {
         if (ERR(err, next)) return;
@@ -153,9 +203,20 @@ router.get('/', (req, res, next) => {
     });
 });
 
-router.post('/', (req, res, next) => {
+router.post('/*', (req, res, next) => {
     debug(`Responding to post with action ${req.body.__action}`);
     if (!res.locals.authz_data.has_course_permission_edit) return next(new Error('Insufficient permissions'));
+
+    let workingPath;
+    if (req.params[0]) {
+        try {
+            workingPath = decodePath(req.params[0]);
+        } catch(err) {
+            return next(new Error(`Invalid path: ${req.params[0]}`));
+        }
+    } else {
+        return next(new Error(`No path`));
+    }
 
     let fileEdit = {
         userID: res.locals.user.user_id,
@@ -166,11 +227,12 @@ router.post('/', (req, res, next) => {
         coursePath: res.locals.course.path,
         uid: res.locals.user.uid,
         user_name: res.locals.user.name,
+        editContents: req.body.file_edit_contents,
     };
 
     // Do not allow users to edit the exampleCourse
-    if (res.locals.course.options.isExampleCourse) {
-        return next(error.make(400, `attempting to edit file inside example course: ${req.query.file}`, {
+    if (res.locals.course.example_course) {
+        return next(error.make(400, `attempting to edit file inside example course: ${workingPath}`, {
             locals: res.locals,
             body: req.body,
         }));
@@ -181,7 +243,7 @@ router.post('/', (req, res, next) => {
     const relPath = path.relative(fileEdit.coursePath, fullPath);
     debug(`Edit file in browser\n fileName: ${fileEdit.fileName}\n coursePath: ${fileEdit.coursePath}\n fullPath: ${fullPath}\n relPath: ${relPath}`);
     if (relPath.split(path.sep)[0] == '..' || path.isAbsolute(relPath)) {
-        return next(error.make(400, `attempting to edit file outside course directory: ${req.query.file}`, {
+        return next(error.make(400, `attempting to edit file outside course directory: ${workingPath}`, {
             locals: res.locals,
             body: req.body,
         }));
@@ -193,9 +255,9 @@ router.post('/', (req, res, next) => {
         // The "Save and Sync" button is enabled only when changes have been made
         // to the file, so - in principle - it should never be the case that editHash
         // and origHash are the same. We will treat this is a catastrophic error.
-        fileEdit.editHash = getHash(req.body.file_edit_contents);
+        fileEdit.editHash = getHash(fileEdit.editContents);
         if (fileEdit.editHash == fileEdit.origHash) {
-            return next(error.make(400, `attempting to save a file without having made any changes: ${req.query.file}`, {
+            return next(error.make(400, `attempting to save a file without having made any changes: ${workingPath}`, {
                 locals: res.locals,
                 body: req.body,
             }));
@@ -204,10 +266,27 @@ router.post('/', (req, res, next) => {
         // Whether or not to pull from remote git repo before proceeding to save and sync
         fileEdit.doPull = (req.body.__action == 'pull_and_save_and_sync');
 
+        if (res.locals.navPage == 'course_admin') {
+            const rootPath = res.locals.course.path;
+            fileEdit.commitMessage = `edit ${path.relative(rootPath, fullPath)}`;
+        } else if (res.locals.navPage == 'instance_admin') {
+            const rootPath = path.join(res.locals.course.path, 'courseInstances', res.locals.course_instance.short_name);
+            fileEdit.commitMessage = `${path.basename(rootPath)}: edit ${path.relative(rootPath, fullPath)}`;
+        } else if (res.locals.navPage == 'assessment') {
+            const rootPath = path.join(res.locals.course.path, 'courseInstances', res.locals.course_instance.short_name, 'assessments', res.locals.assessment.tid);
+            fileEdit.commitMessage = `${path.basename(rootPath)}: edit ${path.relative(rootPath, fullPath)}`;
+        } else if (res.locals.navPage == 'question') {
+            const rootPath = path.join(res.locals.course.path, 'questions', res.locals.question.qid);
+            fileEdit.commitMessage = `${path.basename(rootPath)}: edit ${path.relative(rootPath, fullPath)}`;
+        } else {
+            const rootPath = res.locals.course.path;
+            fileEdit.commitMessage = `edit ${path.relative(rootPath, fullPath)}`;
+        }
+
         async.series([
             (callback) => {
                 debug('Write edit to db');
-                createEdit(fileEdit, req.body.file_edit_contents, (err) => {
+                createEdit(fileEdit, (err) => {
                     if (ERR(err, callback)) return;
                     callback(null);
                 });
@@ -236,28 +315,8 @@ router.post('/', (req, res, next) => {
     }
 });
 
-function b64EncodeUnicode(str) {
-    // (1) use encodeURIComponent to get percent-encoded UTF-8
-    // (2) convert percent encodings to raw bytes
-    // (3) convert raw bytes to Base64
-    return Buffer.from(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (match, p1) => {
-        return String.fromCharCode('0x' + p1);
-    })).toString('base64');
-}
-
-function b64DecodeUnicode(str) {
-    // Going backwards: from bytestream, to percent-encoding, to original string.
-    return decodeURIComponent(Buffer.from(str, 'base64').toString().split('').map((c) => {
-        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-    }).join(''));
-}
-
 function getHash(contents) {
-    return b64EncodeUnicode(sha256(contents).toString());
-}
-
-function getS3Key(editID, fileName) {
-    return `edit_${editID}/${fileName}`;
+    return sha256(contents).toString();
 }
 
 function readEdit(fileEdit, callback) {
@@ -280,15 +339,13 @@ function readEdit(fileEdit, callback) {
                         fileEdit.didSave = result.rows[0].did_save;
                         fileEdit.didSync = result.rows[0].did_sync;
                         fileEdit.jobSequenceId = result.rows[0].job_sequence_id;
-                        if (config.fileEditorUseAws) {
-                            fileEdit.s3_bucket = result.rows[0].s3_bucket;
-                        } else {
-                            fileEdit.localTmpDir = result.rows[0].local_tmp_dir;
-                        }
+                        fileEdit.fileID = result.rows[0].file_id;
                         debug(`Draft: did_save=${fileEdit.didSave}, did_sync=${fileEdit.didSync}`);
                     } else {
                         debug(`Rejected this draft, which had age ${result.rows[0].age} >= 24 hours`);
                     }
+                } else {
+                    debug(`Found no saved drafts`);
                 }
                 callback(null);
             });
@@ -304,37 +361,44 @@ function readEdit(fileEdit, callback) {
                 dir_name: fileEdit.dirName,
                 file_name: fileEdit.fileName,
             };
-            sqldb.query(sql.soft_delete_file_edit, params, (err) => {
+            sqldb.query(sql.soft_delete_file_edit, params, (err, result) => {
                 if (ERR(err, callback)) return;
-                debug('Deleted all previously saved drafts');
+                debug(`Deleted ${result.rowCount} previously saved drafts`);
+                if (result.rowCount > 0) {
+                    result.rows.forEach((row) => {
+                        if (row.file_id == fileEdit.fileID) {
+                            debug(`Defer removal of file_id=${row.file_id} from file store until after reading contents`);
+                        } else {
+                            debug(`Remove file_id=${row.file_id} from file store`);
+                            deleteEditFromFileStore(row.file_id, fileEdit.userID, (err) => {
+                                if (ERR(err, callback)) return;
+                            });
+                        }
+                    });
+                }
                 callback(null);
             });
         },
         (callback) => {
             if ('editID' in fileEdit) {
                 debug('Read contents of file edit');
-                if (config.fileEditorUseAws) {
-                    const params = {
-                        Bucket: config.fileEditorS3Bucket,
-                        Key: getS3Key(fileEdit.editID, fileEdit.fileName),
-                    };
-                    const s3 = new AWS.S3();
-                    s3.getObject(params, (err, data) => {
-                        if (ERR(err, callback)) return;
-                        fileEdit.editContents = b64EncodeUnicode(data.Body);
-                        fileEdit.editHash = getHash(fileEdit.editContents);
-                        callback(null);
-                    });
-                } else {
-                    const fullPath = path.join(fileEdit.localTmpDir, fileEdit.fileName);
-                    fs.readFile(fullPath, 'utf8', (err, contents) => {
-                        if (ERR(err, callback)) return;
-                        debug(`Got contents from ${fullPath}`);
-                        fileEdit.editContents = b64EncodeUnicode(contents);
-                        fileEdit.editHash = getHash(fileEdit.editContents);
-                        callback(null);
-                    });
-                }
+                readEditContents(fileEdit, (err, contents) => {
+                    if (ERR(err, callback)) return;
+                    fileEdit.editContents = contents;
+                    fileEdit.editHash = getHash(fileEdit.editContents);
+                    callback(null);
+                });
+            } else {
+                callback(null);
+            }
+        },
+        (callback) => {
+            if ('fileID' in fileEdit) {
+                debug(`Remove file_id=${fileEdit.fileID} from file store`);
+                deleteEditFromFileStore(fileEdit.fileID, fileEdit.userID, (err) => {
+                    if (ERR(err, callback)) return;
+                    callback(null);
+                });
             } else {
                 callback(null);
             }
@@ -343,6 +407,13 @@ function readEdit(fileEdit, callback) {
         if (ERR(err, callback)) return;
         callback(null);
     });
+}
+
+function readEditContents(fileEdit, callback) {
+    callbackify(async () => {
+        const result = await fileStore.get(fileEdit.fileID);
+        return b64Util.b64EncodeUnicode(result.contents.toString('utf8'));
+    })(callback);
 }
 
 function updateJobSequenceId(fileEdit, job_sequence_id, callback) {
@@ -376,21 +447,14 @@ function updateDidSync(fileEdit, callback) {
     });
 }
 
-function createEdit(fileEdit, contents, callback) {
+function deleteEditFromFileStore(file_id, authn_user_id, callback) {
+    callbackify(async() => {
+        await fileStore.delete(file_id, authn_user_id);
+    })(callback);
+}
+
+function createEdit(fileEdit, callback) {
     async.series([
-        (callback) => {
-            if (config.fileEditorUseAws) {
-                fileEdit.s3_bucket = config.fileEditorS3Bucket;
-                callback(null);
-            } else {
-                tmp.dir((err, path) => {
-                    if (ERR(err, callback)) return;
-                    debug(`Created temporary directory at ${path}`);
-                    fileEdit.localTmpDir = path;
-                    callback(null);
-                });
-            }
-        },
         (callback) => {
             const params = {
                 user_id: fileEdit.userID,
@@ -398,9 +462,26 @@ function createEdit(fileEdit, contents, callback) {
                 dir_name: fileEdit.dirName,
                 file_name: fileEdit.fileName,
             };
-            sqldb.query(sql.soft_delete_file_edit, params, (err) => {
+            sqldb.query(sql.soft_delete_file_edit, params, (err, result) => {
                 if (ERR(err, callback)) return;
-                debug('Deleted all previously saved drafts');
+                debug(`Deleted ${result.rowCount} previously saved drafts`);
+                if (result.rowCount > 0) {
+                    result.rows.forEach((row) => {
+                        debug(`Remove file_id=${row.file_id} from file store`);
+                        deleteEditFromFileStore(row.file_id, fileEdit.userID, (err) => {
+                            if (ERR(err, callback)) return;
+                        });
+                    });
+                }
+                callback(null);
+            });
+        },
+        (callback) => {
+            debug('Write contents to file edit');
+            writeEdit(fileEdit, (err, fileID) => {
+                if (ERR(err, callback)) return;
+                fileEdit.fileID = fileID;
+                fileEdit.didWriteEdit = true;
                 callback(null);
             });
         },
@@ -411,8 +492,7 @@ function createEdit(fileEdit, contents, callback) {
                 dir_name: fileEdit.dirName,
                 file_name: fileEdit.fileName,
                 orig_hash: fileEdit.origHash,
-                local_tmp_dir: fileEdit.localTmpDir || null,
-                s3_bucket: fileEdit.s3_bucket || null,
+                file_id: fileEdit.fileID,
             };
             debug(`Insert file edit into db: ${params.user_id}, ${params.course_id}, ${params.dir_name}, ${params.file_name}`);
             sqldb.queryOneRow(sql.insert_file_edit, params, (err, result) => {
@@ -422,44 +502,26 @@ function createEdit(fileEdit, contents, callback) {
                 callback(null);
             });
         },
-        (callback) => {
-            debug('Write contents to file edit');
-            writeEdit(fileEdit, contents, (err) => {
-                if (ERR(err, callback)) return;
-                callback(null);
-            });
-        },
     ], (err) => {
         if (ERR(err, callback)) return;
         callback(null);
     });
 }
 
-function writeEdit(fileEdit, contents, callback) {
-    if (config.fileEditorUseAws) {
-        const params = {
-            Bucket: fileEdit.s3_bucket,
-            Key: getS3Key(fileEdit.editID, fileEdit.fileName),
-            Body: b64DecodeUnicode(contents),
-        };
-        const s3 = new AWS.S3();
-        s3.putObject(params, (err) => {
-            if (ERR(err, callback)) return;
-            debug(`Wrote file edit to bucket ${params.Bucket} at key ${params.Key} on S3`);
-            fileEdit.editContents = contents;
-            fileEdit.didWriteEdit = true;
-            callback(null);
-        });
-    } else {
-        const fullPath = path.join(fileEdit.localTmpDir, fileEdit.fileName);
-        fs.writeFile(fullPath, b64DecodeUnicode(contents), 'utf8', (err) => {
-            if (ERR(err, callback)) return;
-            debug(`Wrote file edit to ${fullPath}`);
-            fileEdit.editContents = contents;
-            fileEdit.didWriteEdit = true;
-            callback(null);
-        });
-    }
+function writeEdit(fileEdit, callback) {
+    callbackify(async () => {
+        const fileID = await fileStore.upload(
+            fileEdit.fileName,
+            Buffer.from(b64Util.b64DecodeUnicode(fileEdit.editContents), 'utf8'),
+            'instructor_file_edit',
+            null,
+            null,
+            fileEdit.userID,    // TODO: could distinguish between user_id and authn_user_id,
+            fileEdit.userID,    //       although I don't think there's any need to do so
+        );
+        debug(`writeEdit(): wrote file edit to file store with file_id=${fileID}`);
+        return fileID;
+    })(callback);
 }
 
 function saveAndSync(fileEdit, locals, callback) {
@@ -484,6 +546,8 @@ function saveAndSync(fileEdit, locals, callback) {
 
         let courseLock;
         let jobSequenceHasFailed = false;
+        let startGitHash = null;
+        let endGitHash = null;
 
         const _updateJobSequenceId = () => {
             debug(`${job_sequence_id}: _updateJobSequenceId`);
@@ -525,7 +589,7 @@ function saveAndSync(fileEdit, locals, callback) {
                 type: 'lock',
                 description: 'Lock',
                 job_sequence_id: job_sequence_id,
-                on_success: (fileEdit.doPull ? _pullFromRemoteFetch : _checkHash),
+                on_success: _getStartGitHash,
                 on_error: _finishWithFailure,
                 no_job_sequence_update: true,
             };
@@ -550,6 +614,19 @@ function saveAndSync(fileEdit, locals, callback) {
                     }
                     return;
                 });
+            });
+        };
+
+        const _getStartGitHash = () => {
+            courseUtil.getOrUpdateCourseCommitHash(locals.course, (err, hash) => {
+                ERR(err, (e) => logger.error('Error in updateCourseCommitHash()', e));
+                startGitHash = hash;
+
+                if (fileEdit.doPull) {
+                    _pullFromRemoteFetch();
+                } else {
+                    _checkHash();
+                }
             });
         };
 
@@ -616,7 +693,7 @@ function saveAndSync(fileEdit, locals, callback) {
         const _pullFromRemoteHash = () => {
             debug(`${job_sequence_id}: _pullFromRemoteHash`);
             courseUtil.updateCourseCommitHash(locals.course, (err) => {
-                ERR(err, (e) => logger.error(e));
+                ERR(err, (e) => logger.error('Error in updateCourseCommitHash()', e));
                 _checkHash();
             });
         };
@@ -645,7 +722,7 @@ function saveAndSync(fileEdit, locals, callback) {
                     if (err) {
                         job.fail(err);
                     } else {
-                        fileEdit.diskHash = getHash(b64EncodeUnicode(contents));
+                        fileEdit.diskHash = getHash(b64Util.b64EncodeUnicode(contents));
                         if (fileEdit.origHash != fileEdit.diskHash) {
                             job.fail(new Error(`Another user made changes to the file you were editing.`));
                         } else {
@@ -678,7 +755,7 @@ function saveAndSync(fileEdit, locals, callback) {
 
                 job.verbose('Trying to write file');
                 const fullPath = path.join(fileEdit.coursePath, fileEdit.dirName, fileEdit.fileName);
-                fs.writeFile(fullPath, b64DecodeUnicode(fileEdit.editContents), 'utf8', (err) => {
+                fs.writeFile(fullPath, b64Util.b64DecodeUnicode(fileEdit.editContents), 'utf8', (err) => {
                     if (err) {
                         job.fail(err);
                     } else {
@@ -743,7 +820,7 @@ function saveAndSync(fileEdit, locals, callback) {
                 arguments: [
                     '-c', `user.name="${fileEdit.user_name}"`,
                     '-c', `user.email="${fileEdit.uid}"`,
-                    'commit', '-m', `in-browser change to ${fileEdit.fileName}`,
+                    'commit', '-m', fileEdit.commitMessage,
                 ],
                 working_directory: fileEdit.coursePath,
                 env: gitEnv,
@@ -837,9 +914,12 @@ function saveAndSync(fileEdit, locals, callback) {
 
         const _updateCommitHash = () => {
             debug(`${job_sequence_id}: _updateCommitHash`);
-            courseUtil.updateCourseCommitHash(locals.course, (err) => {
-                ERR(err, (e) => logger.error(e));
-                if (fileEdit.needToSync) {
+            courseUtil.updateCourseCommitHash(locals.course, (err, hash) => {
+                ERR(err, (e) => logger.error('Error in updateCourseCommitHash()', e));
+                endGitHash = hash;
+                if (fileEdit.needToSync || config.chunksGenerator) {
+                    /* If we're using chunks, then always sync on edit.  We need the sync data
+                       to force-generate new chunks. */
                     _syncFromDisk();
                 } else {
                     _reloadQuestionServers();
@@ -865,11 +945,36 @@ function saveAndSync(fileEdit, locals, callback) {
                     _finishWithFailure();
                     return;
                 }
-                syncFromDisk.syncDiskToSql(locals.course.path, locals.course.id, job, (err) => {
+                syncFromDisk.syncDiskToSql(locals.course.path, locals.course.id, job, (err, result) => {
                     if (err) {
                         job.fail(err);
+                        return;
+                    }
+
+                    const checkJsonErrors = () => {
+                        if (result.hadJsonErrors) {
+                            job.fail('One or more JSON files contained errors and were unable to be synced');
+                        } else {
+                            job.succeed();
+                        }
+                    };
+
+                    if (config.chunksGenerator) {
+                        callbackify(chunks.updateChunksForCourse)({
+                            coursePath: locals.course.path,
+                            courseId: locals.course.id,
+                            courseData: result.courseData,
+                            oldHash: startGitHash,
+                            newHash: endGitHash,
+                        }, (err) => {
+                            if (err) {
+                                job.fail(err);
+                            } else {
+                                checkJsonErrors();
+                            }
+                        });
                     } else {
-                        job.succeed();
+                        checkJsonErrors();
                     }
                 });
             });

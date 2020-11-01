@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
-    <%- include('../partials/head'); %>
+    <%- include('../partials/head', {pageTitle: `Error ${error.status}`}); %>
   </head>
   <body>
     <%- include('../partials/navbar', {navPage: 'error'}); %>
@@ -13,6 +13,11 @@
 
         <div class="card-body">
           <h4><%= error.message %></h4>
+
+          <% if (error.info) { %>
+          <%- error.info %>
+          <% } %>
+
           <p>
             Error ID: <code><%= id %></code>
           </p>

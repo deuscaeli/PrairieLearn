@@ -1,23 +1,25 @@
 DROP FUNCTION IF EXISTS courses_insert(text,text,text,text,bigint);
+DROP FUNCTION IF EXISTS courses_insert(text,text,text,text,text,bigint);
+DROP FUNCTION IF EXISTS courses_insert(bigint,text,text,text,text,text,bigint);
 
 CREATE OR REPLACE FUNCTION
     courses_insert(
-        short_name text,
-        title text,
-        display_timezone text,
-        path text,
-        repository text,
-        authn_user_id bigint
-    ) returns void
+        IN institution_id bigint,
+        IN short_name text,
+        IN title text,
+        IN display_timezone text,
+        IN path text,
+        IN repository text,
+        IN authn_user_id bigint,
+        OUT new_row pl_courses
+    )
 AS $$
-DECLARE
-    new_row pl_courses%ROWTYPE;
 BEGIN
     BEGIN
         INSERT INTO pl_courses AS c
-            (short_name, title, display_timezone, path, repository)
+            (short_name, title, display_timezone, path, repository, institution_id)
         VALUES
-            (short_name, title, display_timezone, path, repository)
+            (short_name, title, display_timezone, path, repository, institution_id)
         RETURNING
             c.* INTO new_row;
     EXCEPTION

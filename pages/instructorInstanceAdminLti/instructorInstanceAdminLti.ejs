@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
-    <%- include('../partials/head'); %>
+    <%- include('../partials/head', {pageTitle: 'LTI'}); %>
   </head>
   <body>
     <script>
@@ -17,8 +17,8 @@
       }
       </script>
     <%- include('../partials/navbar'); %>
-    <div id="content" class="container">
-      <%- include('../partials/navtabs'); %>
+    <div id="content" class="container-fluid">
+      <%- include('../partials/courseInstanceSyncErrorsAndWarnings'); %>
 
       <!-- ###################################################################### -->
       <!-- ###################################################################### -->
